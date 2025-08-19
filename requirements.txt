@@ -1,0 +1,6 @@
+flask
+flask-cors
+huggingface_hub
+torch
+numpy
+requests
