@@ -32,11 +32,11 @@ def infer():
     요청 JSON:
       {
         "file_path": ".../sub-044_task-eyesclosed_eeg.set",
-        "true_label": "CN" | "FTD" | "AD",      (옵션)
-        "subject_id": "sub-044",                (옵션)
-        "enforce_two_minutes": true | false,    (옵션, 기본 true)
+        "true_label": "CN" | "FTD" | "AD",       (옵션)
+        "subject_id": "sub-044",                 (옵션)
+        "enforce_two_minutes": true | false,     (옵션, 기본 true)
         "device": "muse|hybrid_black|union10|total19", (옵션, 기본 "muse")
-        "ver": "14"                             (옵션, 기본 ENV EEG_WEIGHTS_VER 또는 "14")
+        "ver": "14"                              (옵션, 기본 ENV EEG_WEIGHTS_VER 또는 "14")
       }
     """
     try:
@@ -54,7 +54,6 @@ def infer():
                          f"Choose one of {list(CHANNEL_GROUPS.keys())}"
             }), 400
 
-        # NEW: HF 버전
         ver = str(payload.get("ver") or os.getenv("EEG_WEIGHTS_VER", "14")).strip()
 
         if not file_path:
@@ -63,7 +62,6 @@ def infer():
         engine = EEGInferenceEngine(
             device_type=device_type,
             version=ver,
-            # hf_token은 필요 시 환경변수 HF_TOKEN 로 세팅
         )
         result = engine.infer(
             file_path=file_path,
@@ -71,6 +69,13 @@ def infer():
             true_label=true_label,
             enforce_two_minutes=enforce_two_minutes
         )
+        
+        # 추가된 로직: prob_mean에서 가장 높은 확률의 레이블을 찾아서 추가
+        if 'prob_mean' in result:
+            subject_probs = result['prob_mean']
+            subject_pred_label = max(subject_probs, key=subject_probs.get)
+            result['subject_pred_label'] = subject_pred_label
+
         return jsonify({"status": "ok", "result": result}), 200
 
     except FileNotFoundError as e:
@@ -81,7 +86,8 @@ def infer():
         return jsonify({"status": "error", "error": f"{e.name}: {e.description}"}), e.code
     except Exception as e:
         return jsonify({"status": "error", "error": repr(e)}), 500
+    
 
-
+    
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)

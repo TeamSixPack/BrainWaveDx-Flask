@@ -1,460 +1,780 @@
-# ---------------------------------------------------------
-# EEGLAB(.set) 로드 & 2분 구간 추론
-# - 누락 채널 0-패딩 대신 강력한 alias/정규화 매칭 적용
-# - CAR, bandpass, 조건부 notch + 리샘플
-# - 품질(bad 세그) 가중 로짓 평균 → subject-level 확률/판정
-# - 세그 평균 확률(prob_mean)도 함께 제공
-# ---------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+eeg_model.py
+- HuggingFace에서 가중치 자동 다운로드
+- 체크포인트 키/하이퍼파라미터(k1=kernel_length, k2=sep_length, F1/D/F2) 자동 추정
+- Part10 스타일: 5s 세그먼트, 2.5s hop(50% 겹침), best 2분 창 선택
+"""
 import os
 import re
-import json
-from typing import Union, Optional, Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-
-# huggingface_hub
-try:
-    from huggingface_hub import hf_hub_download
-except ImportError:
-    import sys, subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "huggingface_hub"])
-    from huggingface_hub import hf_hub_download
-
-# MNE
+import torch.nn.functional as F
 import mne
+from huggingface_hub import snapshot_download
 
-# ========== 모델 정의 ==========
-class EEGNetV4(nn.Module):
-    def __init__(self, n_chans, n_classes, F1=32, D=2, kernel_length=250, pool1=4, pool2=8, dropout_rate=0.3):
+try:
+    from safetensors.torch import load_file as safe_load_file
+except Exception:
+    safe_load_file = None
+
+# ========================= 기본 설정 =========================
+CLASS_NAMES = ['CN', 'AD', 'FTD']
+
+CHANNEL_GROUPS: Dict[str, List[str]] = {
+    'muse': ['T5','T6','F7','F8'],  # 선생님 코드 순서에 맞춤
+    'hybrid_black': ['Fz','C3','Cz','C4','Pz','T5','T6','O1'],
+    'union10': ['T5','T6','F7','F8','Fz','C3','Cz','C4','Pz','O1'],
+    'total19': ['Fp1','Fp2','F7','F3','Fz','F4','F8','T3','C3','Cz','C4','T4','T5','P3','Pz','P4','T6','O1','O2'],
+}
+
+LOW_FREQ = 1.0
+HIGH_FREQ = 40.0
+TARGET_SRATE = 250
+SEG_SECONDS = 5.0
+EVAL_HOP_SEC = 2.5          # ✔ 50% 겹침
+WINDOW_NEED_SECONDS = 120
+BATCH_SIZE = 64
+EVAL_PER_RECORD_ZSCORE = True
+
+DECISION_BIAS_VEC = np.zeros(len(CLASS_NAMES), dtype=np.float32)
+def apply_calibration(logits: np.ndarray) -> np.ndarray:
+    return logits  # 필요시 온도스케일링 등 삽입
+
+
+# ========================= 추가됨 =========================
+
+class EEGInferenceEngine:
+    def __init__(self, device_type: str = 'muse',
+                 version: Optional[str] = None,
+                 torch_device: Optional[str] = None,
+                 hf_token: Optional[str] = None,
+                 csv_order: Optional[Tuple[str]] = None):   # ✅ 추가
+        self.device_type = device_type.lower().strip()
+        if self.device_type not in CHANNEL_GROUPS:
+            raise ValueError(f"Unknown device_type '{self.device_type}'. Choose one of {list(CHANNEL_GROUPS.keys())}")
+        
+        # 기본 채널 정의
+        self.channels = CHANNEL_GROUPS[self.device_type]
+
+        # ✅ 사용자가 csv_order 지정 시 반영
+        if csv_order is not None:
+            if len(csv_order) != len(self.channels):
+                raise ValueError(f"csv_order length {len(csv_order)} != expected {len(self.channels)} for {self.device_type}")
+            self.channels = list(csv_order)
+
+        self.samples_per_seg = int(TARGET_SRATE * SEG_SECONDS)
+        self.hop_samples = int(TARGET_SRATE * EVAL_HOP_SEC)
+        self.torch_device = torch_device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+# ========================= 모델 정의 =========================
+class EEGNetV4Compat(nn.Module):
+    """
+    체크포인트 키: firstconv / depthwise / separable / classifier
+    k1, k2, F1, D, F2를 외부에서 주입 (HF config.json 또는 state_dict에서 추정)
+    """
+    def __init__(self, n_classes: int, Chans: int,
+                 k1: int, k2: int, F1: int, D: int, F2: int,
+                 pool1: int = 4, pool2: int = 8, dropout: float = 0.3):
         super().__init__()
-        F2 = F1 * D
         self.firstconv = nn.Sequential(
-            nn.Conv2d(1, F1, (1, kernel_length), padding=(0, kernel_length // 2), bias=False),
+            nn.Conv2d(1, F1, (1, k1), padding=(0, k1 // 2), bias=False),
             nn.BatchNorm2d(F1)
         )
         self.depthwise = nn.Sequential(
-            nn.Conv2d(F1, F2, (n_chans, 1), groups=F1, bias=False),
-            nn.BatchNorm2d(F2),
-            nn.ELU(),
-            nn.AvgPool2d((1, pool1)),
-            nn.Dropout(dropout_rate)
+            nn.Conv2d(F1, F1 * D, (Chans, 1), groups=F1, bias=False),
+            nn.BatchNorm2d(F1 * D)
         )
         self.separable = nn.Sequential(
-            nn.Conv2d(F2, F2, (1, 32), groups=F2, padding=(0, 16), bias=False),
-            nn.Conv2d(F2, F2, (1, 1), bias=False),
-            nn.BatchNorm2d(F2),
-            nn.ELU(),
-            nn.AvgPool2d((1, pool2)),
-            nn.Dropout(dropout_rate)
+            nn.Conv2d(F1 * D, F1 * D, (1, k2), padding=(0, k2 // 2), groups=F1 * D, bias=False),
+            nn.Conv2d(F1 * D, F2, (1, 1), bias=False),
+            nn.BatchNorm2d(F2)
         )
+        self.elu = nn.ELU()
+        self.pool1 = nn.AvgPool2d((1, pool1))
+        self.pool2 = nn.AvgPool2d((1, pool2))
+        self.drop = nn.Dropout(dropout)
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Linear(F2, n_classes)
 
-    def forward(self, x):  # x: (N,1,C,T)
+    def forward(self, x):
         x = self.firstconv(x)
-        x = self.depthwise(x)
-        x = self.separable(x)
-        x = self.gap(x)
-        x = torch.flatten(x, 1)
+        x = self.depthwise(x); x = self.elu(x); x = self.pool1(x); x = self.drop(x)
+        x = self.separable(x); x = self.elu(x); x = self.pool2(x); x = self.drop(x)
+        x = self.gap(x).squeeze(-1).squeeze(-1)
         x = self.classifier(x)
         return x
 
-# =============== 라벨 맵 정규화 ===============
-def _normalize_label_maps(cfg: dict) -> dict:
-    default_idx2lab = {0: "CN", 1: "AD", 2: "FTD"}
+# ========================= 유틸 =========================
+def extract_subject_id(file_path: str) -> Optional[str]:
+    m = re.search(r"(sub-\d+)", file_path)
+    return m.group(1) if m else None
 
-    idx2 = cfg.get("idx_to_label") or default_idx2lab.copy()
-    lab2 = cfg.get("label_to_idx")
+def truthy(x) -> bool:
+    if isinstance(x, bool): return x
+    if x is None: return False
+    return str(x).strip().lower() in ('1','true','on','yes','y')
 
-    try:
-        if isinstance(next(iter(idx2.keys())), str):
-            idx2 = {int(k): v for k, v in idx2.items()}
-    except StopIteration:
-        idx2 = default_idx2lab.copy()
-    except Exception:
-        idx2 = default_idx2lab.copy()
+def _strip_prefix(sd: dict, prefixes=("module.","model.")) -> dict:
+    out = {}
+    for k, v in sd.items():
+        kk = k
+        for p in prefixes:
+            if kk.startswith(p): kk = kk[len(p):]
+        out[kk] = v
+    return out
 
-    n = int(cfg.get("n_classes", len(idx2) if len(idx2) > 0 else 3))
-    want_keys = set(range(n))
-    if set(idx2.keys()) != want_keys:
-        if isinstance(lab2, dict):
-            try:
-                any_v = next(iter(lab2.values()))
-                if isinstance(any_v, str):
-                    lab2 = {k: int(v) for k, v in lab2.items()}
-            except StopIteration:
-                lab2 = None
-        if isinstance(lab2, dict) and set(lab2.values()) == want_keys:
-            inv = {v: k for k, v in lab2.items()}
-            idx2 = {i: inv.get(i, default_idx2lab.get(i, f"class_{i}")) for i in range(n)}
+def _load_state_dict(weights_path: str, map_location: str):
+    ext = os.path.splitext(weights_path)[-1].lower()
+    if ext == ".safetensors":
+        if safe_load_file is None:
+            raise RuntimeError("pip install safetensors 필요")
+        sd = dict(safe_load_file(weights_path))
+    else:
+        obj = torch.load(weights_path, map_location=map_location)
+        if isinstance(obj, dict):
+            for k in ["state_dict","model_state_dict","weights","params","model","net"]:
+                if k in obj and isinstance(obj[k], dict):
+                    sd = obj[k]; break
+            else:
+                # 순수 state_dict
+                if all(isinstance(v, torch.Tensor) for v in obj.values()):
+                    sd = obj
+                elif isinstance(obj.get("model", None), nn.Module):
+                    sd = obj["model"].state_dict()
+                else:
+                    raise RuntimeError("state_dict를 찾지 못했습니다.")
+        elif isinstance(obj, nn.Module):
+            sd = obj.state_dict()
         else:
-            idx2 = {i: default_idx2lab.get(i, f"class_{i}") for i in range(n)}
+            raise RuntimeError("지원되지 않는 가중치 포맷")
+    return _strip_prefix(sd)
 
-    lab2 = {v: k for k, v in idx2.items()}
-    cfg["idx_to_label"] = idx2
-    cfg["label_to_idx"] = lab2
-    cfg["n_classes"] = n
-    return cfg
+def _looks_compat(sd: dict) -> bool:
+    # firstconv.0.weight 존재 여부로 판정
+    return any(k.startswith("firstconv.0.weight") or k.endswith("firstconv.0.weight") for k in sd.keys())
 
-# =============== HF 모델 로드 ===============
-def load_hf_model(repo_id: str, device: Optional[str] = None, token: Optional[str] = None):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    cfg_path = hf_hub_download(repo_id=repo_id, filename="config.json", token=token)
-    wt_path  = hf_hub_download(repo_id=repo_id, filename="pytorch_model.bin", token=token)
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    cfg = _normalize_label_maps(cfg)
-
-    n_chans   = int(cfg.get("n_chans", len(cfg.get("pick_channels", [])) or 8))
-    n_classes = int(cfg.get("n_classes", 3))
-    model = EEGNetV4(
-        n_chans=n_chans,
-        n_classes=n_classes,
-        F1=int(cfg.get("F1", 32)),
-        D=int(cfg.get("D", 2)),
-        kernel_length=int(cfg.get("kernel_length", 250)),
-        pool1=int(cfg.get("pool1", 4)),
-        pool2=int(cfg.get("pool2", 8)),
-        dropout_rate=float(cfg.get("dropout_rate", 0.3)),
-    ).to(device)
-
-    state = torch.load(wt_path, map_location=device)
-    if isinstance(state, dict) and "state_dict" in state:
-        state = state["state_dict"]
-    elif isinstance(state, dict) and "model_state" in state:
-        state = state["model_state"]
-    model.load_state_dict(state, strict=True)
-    model.eval()
-    return model, cfg
-
-# ==================== 전처리 유틸(MNE) ====================
-def _apply_car(raw: mne.io.BaseRaw):
-    picks = mne.pick_types(raw.info, eeg=True, misc=False)
-    if len(picks) >= 2:
-        raw.set_eeg_reference('average', projection=False, verbose=False)
-    return raw
-
-def _detect_mains_hz(raw: mne.io.BaseRaw, ratio_thresh: float = 3.0) -> int:
+def _infer_hparams_from_sd(sd: dict, chans: int) -> Tuple[int,int,int,int,int,int,int]:
+    """
+    F1, D, F2, k1, k2, pool1, pool2 추정
+    - k1: firstconv.0.weight[..., k1]
+    - k2: separable.0.weight[..., k2]  ✔ (수정 포인트)
+    - F1: firstconv.0.weight.shape[0]
+    - D : depthwise.0.weight.shape[0] // F1
+    - F2: classifier.weight.shape[1] (우선) / separable.1.weight.shape[0] (보조)
+    - pool1/pool2: 일반적으로 (4,8) — sd로 직접 추정 어려워 기본값 사용
+    """
+    # 기본값(선생님 코드에 맞춤)
+    F1, D, F2, k1, k2, pool1, pool2 = 32, 2, 64, 250, 32, 4, 8
     try:
-        psd = mne.time_frequency.psd_welch(raw, fmin=40, fmax=70, n_fft=2048, n_overlap=1024, verbose=False)
-        if isinstance(psd, tuple):
-            psd_vals, freqs = psd
-        else:
-            psd_vals = psd.get_data(); freqs = psd.freqs
-        psd_median = np.median(psd_vals, axis=0)
-
-        def band_med(f0, w=2.0):
-            m = (freqs >= (f0 - w)) & (freqs <= (f0 + w))
-            return np.median(psd_median[m]) if m.any() else 0.0
-
-        p50 = band_med(50.0); base50 = np.median(psd_median[(freqs>=40)&(freqs<=46)]) if ((freqs>=40)&(freqs<=46)).any() else 1.0
-        p60 = band_med(60.0); base60 = np.median(psd_median[(freqs>=64)&(freqs<=70)]) if ((freqs>=64)&(freqs<=70)).any() else 1.0
-        r50, r60 = p50/(base50+1e-9), p60/(base60+1e-9)
-        if r50 >= ratio_thresh and r50 >= r60: return 50
-        if r60 >= ratio_thresh and r60 >  r50: return 60
+        if "firstconv.0.weight" in sd:
+            w = sd["firstconv.0.weight"]           # [F1, 1, 1, k1]
+            F1 = int(w.shape[0]); k1 = int(w.shape[-1])
+        if "depthwise.0.weight" in sd:
+            w = sd["depthwise.0.weight"]           # [F1*D, 1, chans, 1]
+            D = int(w.shape[0] // F1)
+        if "separable.0.weight" in sd:
+            w = sd["separable.0.weight"]           # [F1*D, 1, 1, k2]
+            k2 = int(w.shape[-1])                  # ✔ k2를 체크포인트에서 직접 추정
+        if "separable.1.weight" in sd:
+            w = sd["separable.1.weight"]           # [F2, F1*D, 1, 1]
+            F2 = int(w.shape[0])
+        if "classifier.weight" in sd:
+            F2 = int(sd["classifier.weight"].shape[1])  # 최종 확정
     except Exception:
         pass
-    return 0
+    return F1, D, F2, k1, k2, pool1, pool2
 
-def _read_filter_resample(filepath: str, cfg: dict) -> mne.io.BaseRaw:
-    low = float(cfg.get("low_freq", 1.0))
-    high = float(cfg.get("high_freq", 40.0))
-    target_srate = int(cfg.get("target_srate", 250))
-    enable_notch = bool(cfg.get("enable_conditional_notch", True))
-    notch_harmonics = bool(cfg.get("notch_harmonics", True))
+def _load_hf_config(repo_dir: str) -> dict:
+    # config.json이 있으면 읽어 하이퍼파라미터 보정
+    cfg_path = os.path.join(repo_dir, "config.json")
+    if os.path.exists(cfg_path):
+        try:
+            import json
+            with open(cfg_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-    raw = mne.io.read_raw_eeglab(filepath, preload=True, verbose=False)
+def _hf_download(device_type: str, channel_len: int, ver: str, token: Optional[str]) -> Tuple[str, dict]:
+    repo_id = f"ardor924/EEGNetV4-{channel_len}ch-{device_type}-Ver{ver}"
+    allow_patterns = ["*.pt", "*.pth", "*.bin", "*.safetensors", "config.json"]
+    local_dir = snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns, token=token)
+    # 가중치 파일 선택
+    preferred_exts = (".pt",".pth",".bin",".safetensors")
+    weights = []
+    for root, _, files in os.walk(local_dir):
+        for fn in files:
+            if fn.lower().endswith(preferred_exts):
+                weights.append(os.path.join(root, fn))
+    if not weights:
+        raise FileNotFoundError(f"[HF] {repo_id} 에 가중치 파일이 없습니다.")
+    weights.sort()
+    cfg = _load_hf_config(local_dir)
+    return weights[0], cfg
 
-    if enable_notch:
-        mains = _detect_mains_hz(raw)
-        if mains in (50, 60):
-            freqs = [mains, mains*2] if notch_harmonics else [mains]
-            try: raw.notch_filter(freqs=freqs, verbose=False)
-            except Exception: pass
+# ========================= 엔진 =========================
+class EEGInferenceEngine:
+    def __init__(self, device_type: str = 'muse',
+                 version: Optional[str] = None,
+                 torch_device: Optional[str] = None,
+                 hf_token: Optional[str] = None):
+        self.device_type = device_type.lower().strip()
+        if self.device_type not in CHANNEL_GROUPS:
+            raise ValueError(f"Unknown device_type '{self.device_type}'. Choose one of {list(CHANNEL_GROUPS.keys())}")
+        self.channels = CHANNEL_GROUPS[self.device_type]
+        self.samples_per_seg = int(TARGET_SRATE * SEG_SECONDS)
+        self.hop_samples = int(TARGET_SRATE * EVAL_HOP_SEC)
+        self.torch_device = torch_device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
-    raw.filter(l_freq=low, h_freq=high, verbose=False)
-    raw.resample(sfreq=target_srate, npad="auto", verbose=False)
-    raw = _apply_car(raw)
-    return raw
+        self.version = str(version or os.getenv("EEG_WEIGHTS_VER", "14")).strip()
+        self.hf_token = hf_token or os.getenv("HF_TOKEN", None)
 
-# ---------- 채널 정규화/매칭 ----------
-def _normalize_ch_name(name: str) -> str:
-    """대소문자, 공백/구두점, 접두/접미(REF/LE/A1/A2/AVG 등) 제거."""
-    n = name.upper().strip()
-    n = re.sub(r'^(EEG[ -]*)', '', n)               # "EEG ", "EEG-" 제거
-    n = n.replace('.', '').replace('_', '').replace(' ', '')
-    n = re.sub(r'-(REF|LE|A1|A2|AVG|AVERAGE)$', '', n)
-    return n
-
-def _get_data_fixed_channels(raw: mne.io.BaseRaw, pick_channels: List[str],
-                             min_std: float = 1e-7) -> Tuple[np.ndarray, List[dict], List[str]]:
-    """
-    항상 pick_channels 순서(C,T)로 반환. 채널명 alias+정규화 매칭.
-    - '평평한(분산 거의 0)' 채널은 버리고 다음 alias를 시도
-    - 매칭 정보(channels_map)과 원본 채널명 목록도 함께 반환
-    """
-    raw_chs = list(raw.ch_names)
-    norm2orig = {}
-    for ch in raw_chs:
-        norm2orig.setdefault(_normalize_ch_name(ch), ch)
-
-    ALIAS = {
-        "T5":  ["T5", "T7", "TP7", "P7", "T3"],
-        "T6":  ["T6", "T8", "TP8", "P8", "T4"],
-        "F7":  ["F7", "FT7", "AF7"],
-        "F8":  ["F8", "FT8", "AF8"],
-        "FZ":  ["FZ"],
-        "CZ":  ["CZ"],
-        "C3":  ["C3", "FC3", "CP3"],
-        "C4":  ["C4", "FC4", "CP4"],
-        "PZ":  ["PZ"],
-        "O1":  ["O1", "PO7"],
-        "O2":  ["O2", "PO8"],
-    }
-
-    def _resolve_candidate_name(cand: str) -> Optional[str]:
-        nc = _normalize_ch_name(cand)
-        if nc in norm2orig:
-            return norm2orig[nc]
-        for k in norm2orig.keys():
-            if k == nc or k.endswith(nc) or (nc in k):
-                return norm2orig[k]
-        return None
-
-    T = raw.n_times
-    data_list, mapping = [], []
-    found_any = 0
-
-    for target in pick_channels:
-        cands = ALIAS.get(target, [target])
-        best_name, best_std = None, -1.0
-        picked_name, picked_flat = None, False
-
-        # 1) 평평하지 않은(표준편차 >= min_std) 후보를 먼저 찾기
-        for cand in cands:
-            nm = _resolve_candidate_name(cand)
-            if nm is None:
-                continue
-            v = raw.get_data(picks=[nm]).astype(np.float32)[0]
-            sd = float(np.nanstd(v))
-            if sd >= min_std:
-                picked_name = nm
-                picked_flat = False
-                break
-            # 평평하면 후보로만 기록(나중에 최댓값 선택 대비)
-            if sd > best_std:
-                best_std = sd
-                best_name = nm
-
-        # 2) 다 평평했다면 최대 표준편차 후보라도 사용
-        if picked_name is None and best_name is not None:
-            v = raw.get_data(picks=[best_name]).astype(np.float32)[0]
-            picked_name = best_name
-            picked_flat = True  # 평평함 경고 표시
-
-        if picked_name is None:
-            # 후보 전부 실패 → 0패딩
-            vec = np.zeros(T, dtype=np.float32)
-            mapping.append({"target": target, "picked": None, "flat": True})
-        else:
-            found_any += 1
-            vec = raw.get_data(picks=[picked_name]).astype(np.float32)[0]
-            mapping.append({"target": target, "picked": picked_name, "flat": picked_flat})
-        data_list.append(vec)
-
-    if found_any == 0:
-        raise ValueError(
-            f"채널 매칭 실패: 요청={pick_channels} / 데이터 채널(예시 10개)={raw_chs[:10]}"
+        # 1) HF에서 다운로드 + config 로딩
+        weights_path, cfg = _hf_download(
+            device_type=self.device_type,
+            channel_len=len(self.channels),
+            ver=self.version,
+            token=self.hf_token,
         )
 
-    return np.stack(data_list, axis=0), mapping, raw_chs
+        # 2) state_dict 로딩 후 구조/하이퍼 추정
+        sd = _load_state_dict(weights_path, map_location=self.torch_device)
+        if not _looks_compat(sd):
+            raise RuntimeError("이 체크포인트는 지원되는 키(firstconv/depthwise/separable/classifier)가 아닙니다.")
 
-# ---------- 세그먼트/품질 ----------
-def _segment_array(data: np.ndarray, srate: int, win_sec: float, hop_sec: float) -> np.ndarray:
-    C, T = data.shape
-    win = int(win_sec * srate)
-    hop = int(hop_sec * srate)
-    if T < win: return np.empty((0, C, win), dtype=np.float32)
-    segs = [data[:, s:s+win] for s in range(0, T - win + 1, hop)]
-    return np.stack(segs, axis=0).astype(np.float32) if segs else np.empty((0, C, win), dtype=np.float32)
+        F1, D, F2, k1, k2, pool1, pool2 = _infer_hparams_from_sd(sd, chans=len(self.channels))
+        # config.json 값이 있으면 우선 적용(안전 보정)
+        k1 = int(cfg.get("kernel_length", k1))
+        k2 = int(cfg.get("sep_length", k2))
+        F1 = int(cfg.get("F1", F1))
+        D  = int(cfg.get("D", D))
+        pool1 = int(cfg.get("pool1", pool1))
+        pool2 = int(cfg.get("pool2", pool2))
+        dropout = float(cfg.get("dropout_rate", 0.3))
 
-def _robust_z(x: np.ndarray) -> np.ndarray:
-    med = np.median(x); mad = np.median(np.abs(x - med)) + 1e-6
-    return (x - med) / (1.4826 * mad)
+        # 3) 모델 구성/로드
+        self.model = EEGNetV4Compat(
+            n_classes=len(CLASS_NAMES),
+            Chans=len(self.channels),
+            k1=k1, k2=k2, F1=F1, D=D, F2=F2,
+            pool1=pool1, pool2=pool2, dropout=dropout
+        ).to(self.torch_device)
+        self.model.load_state_dict(sd, strict=True)
+        self.model.eval()
 
-def _segment_quality_metrics(segs: np.ndarray, srate: int, lf_env_win_sec: float = 0.5,
-                             thr_ptp_z: float = 5.0, thr_lf_z: float = 3.0) -> Dict[str, np.ndarray]:
-    if segs.shape[0] == 0:
-        return {"bad": np.array([], dtype=bool)}
-    ptp = segs.max(axis=2) - segs.min(axis=2)   # (N,C)
-    ptp_max = ptp.max(axis=1)                   # (N,)
-    ptp_z = _robust_z(ptp_max)
+    # -------- 전처리 --------
+    def load_raw_fixed_channels(self, file_path: str):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"EEG file not found: {file_path}")
+        raw = mne.io.read_raw_eeglab(file_path, preload=True, verbose='ERROR')
+        missing = [ch for ch in self.channels if ch not in raw.ch_names]
+        if missing:
+            raise ValueError(f"Channels missing in file: {missing}\nPresent: {raw.ch_names}\nExpected: {self.channels}")
+        raw.pick_channels(self.channels)
+        raw.filter(LOW_FREQ, HIGH_FREQ, fir_design='firwin', verbose='ERROR')
+        raw.resample(TARGET_SRATE)
+        return raw
 
-    k = max(1, int(lf_env_win_sec * srate))
-    if k > 1:
-        absx = np.abs(segs)
-        csum = np.cumsum(absx, axis=2)
-        env = (csum[:, :, k:] - csum[:, :, :-k]) / k  # (N,C,T-k)
-        env_max = env.max(axis=2)                     # (N,C)
+    def _segment_array(self, data: np.ndarray) -> np.ndarray:
+        C, T = data.shape
+        win = self.samples_per_seg
+        hop = max(1, self.hop_samples)
+        if T < win:
+            return np.empty((0, C, win), dtype=np.float32)
+        idxs = list(range(0, T - win + 1, hop))
+        segs = np.stack([data[:, i:i+win] for i in idxs], axis=0).astype(np.float32)
+        return segs
+
+    def _per_record_zscore(self, segs: np.ndarray) -> np.ndarray:
+        mean = segs.mean(axis=(0,2), keepdims=True)
+        std = segs.std(axis=(0,2), keepdims=True) + 1e-7
+        return (segs - mean) / std
+
+    def _segment_quality_metrics(self, segs: np.ndarray) -> Dict[str, np.ndarray]:
+        std_per_seg = segs.std(axis=(1,2))
+        med = np.median(std_per_seg)
+        bad = std_per_seg < (0.2 * med + 1e-8)
+        return {"bad": bad}
+
+    @torch.no_grad()
+    def _logits_for_segments(self, segs: np.ndarray) -> np.ndarray:
+        if segs.shape[0] == 0:
+            return np.empty((0, len(CLASS_NAMES)), dtype=np.float32)
+        x = torch.from_numpy(segs)[:, None, :, :].to(self.torch_device, non_blocking=True)
+        outs = []
+        for i in range(0, x.size(0), BATCH_SIZE):
+            outs.append(self.model(x[i:i+BATCH_SIZE]).detach().cpu().numpy().astype(np.float32))
+        return np.concatenate(outs, axis=0)
+
+    @staticmethod
+    def _softmax_np(x: np.ndarray) -> np.ndarray:
+        x = x - np.max(x, axis=-1, keepdims=True)
+        e = np.exp(x)
+        return e / (np.sum(e, axis=-1, keepdims=True) + 1e-12)
+
+    def _choose_best_window(self, logits_all: np.ndarray, need_eval: int) -> Tuple[int, int]:
+        if logits_all.shape[0] < need_eval:
+            return 0, logits_all.shape[0]
+        probs = self._softmax_np(logits_all)
+        top1 = probs.max(axis=1)
+        cumsum = np.concatenate([[0.0], np.cumsum(top1)])
+        best, best_sum = 0, -1.0
+        for s in range(0, len(top1) - need_eval + 1):
+            sm = cumsum[s+need_eval] - cumsum[s]
+            if sm > best_sum:
+                best_sum, best = sm, s
+        return best, need_eval
+
+    # -------- 엔드투엔드 --------
+    def infer(self, file_path: str,
+              subject_id: Optional[str] = None,
+              true_label: Optional[str] = None,
+              enforce_two_minutes: bool = True) -> Dict:
+        raw = self.load_raw_fixed_channels(file_path)
+        data = raw.get_data()  # (C, T)
+        segs = self._segment_array(data)
+
+        need_eval = int((WINDOW_NEED_SECONDS - SEG_SECONDS) / EVAL_HOP_SEC) + 1
+        N = segs.shape[0]
+        if enforce_two_minutes and N < need_eval:
+            raise ValueError(f"Recording too short for 2-minute window: need {need_eval} segments, got {N}")
+
+        if EVAL_PER_RECORD_ZSCORE:
+            segs = self._per_record_zscore(segs)
+
+        logits_all = self._logits_for_segments(segs)
+        if N == 0:
+            raise ValueError("No segments could be formed from the recording.")
+
+        s_best, use = (0, N) if N < need_eval else self._choose_best_window(logits_all, need_eval)
+        block_logits = logits_all[s_best:s_best+use]
+        block_segs   = segs[s_best:s_best+use]
+
+        qm = self._segment_quality_metrics(block_segs)
+        w = np.where(qm["bad"], 1e-3, 1.0).astype(np.float32)
+
+        logits_cal  = apply_calibration(block_logits)
+        logits_bias = logits_cal - DECISION_BIAS_VEC[None, :]
+        probs       = self._softmax_np(logits_bias)
+
+        y_pred_seg = probs.argmax(axis=1)
+        counts = {CLASS_NAMES[i]: int((y_pred_seg == i).sum()) for i in range(len(CLASS_NAMES))}
+        majority_idx = int(np.bincount(y_pred_seg, minlength=len(CLASS_NAMES)).argmax())
+        majority_label = CLASS_NAMES[majority_idx]
+
+        w_sum = float(w.sum()) + 1e-8
+        subj_logit = (logits_bias * w[:, None]).sum(axis=0) / w_sum
+        subj_prob  = self._softmax_np(subj_logit[None, :])[0]
+        prob_mean  = {CLASS_NAMES[i]: float(subj_prob[i]) for i in range(len(CLASS_NAMES))}
+
+        segment_acc = None
+        if true_label:
+            tl = str(true_label).strip().upper()
+            if tl in ("C","A","F"): tl = {"C":"CN","A":"AD","F":"FTD"}[tl]
+            if tl in CLASS_NAMES:
+                tl_idx = CLASS_NAMES.index(tl)
+                segment_acc = float((y_pred_seg == tl_idx).mean())
+
+# -*- coding: utf-8 -*-
+"""
+eeg_model.py
+- HuggingFace에서 가중치 자동 다운로드
+- 체크포인트 키/하이퍼파라미터(k1=kernel_length, k2=sep_length, F1/D/F2) 자동 추정
+- Part10 스타일: 5s 세그먼트, 2.5s hop(50% 겹침), best 2분 창 선택
+"""
+import os
+import re
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import mne
+from huggingface_hub import snapshot_download
+
+try:
+    from safetensors.torch import load_file as safe_load_file
+except Exception:
+    safe_load_file = None
+
+# ========================= 기본 설정 =========================
+CLASS_NAMES = ['CN', 'AD', 'FTD']
+
+CHANNEL_GROUPS: Dict[str, List[str]] = {
+    'muse': ['T5','T6','F7','F8'],  # 선생님 코드 순서에 맞춤
+    'hybrid_black': ['Fz','C3','Cz','C4','Pz','T5','T6','O1'],
+    'union10': ['T5','T6','F7','F8','Fz','C3','Cz','C4','Pz','O1'],
+    'total19': ['Fp1','Fp2','F7','F3','Fz','F4','F8','T3','C3','Cz','C4','T4','T5','P3','Pz','P4','T6','O1','O2'],
+}
+
+LOW_FREQ = 1.0
+HIGH_FREQ = 40.0
+TARGET_SRATE = 250
+SEG_SECONDS = 5.0
+EVAL_HOP_SEC = 2.5          # ✔ 50% 겹침
+WINDOW_NEED_SECONDS = 120
+BATCH_SIZE = 64
+EVAL_PER_RECORD_ZSCORE = True
+
+DECISION_BIAS_VEC = np.zeros(len(CLASS_NAMES), dtype=np.float32)
+def apply_calibration(logits: np.ndarray) -> np.ndarray:
+    return logits  # 필요시 온도스케일링 등 삽입
+
+# ========================= 모델 정의 =========================
+class EEGNetV4Compat(nn.Module):
+    """
+    체크포인트 키: firstconv / depthwise / separable / classifier
+    k1, k2, F1, D, F2를 외부에서 주입 (HF config.json 또는 state_dict에서 추정)
+    """
+    def __init__(self, n_classes: int, Chans: int,
+                 k1: int, k2: int, F1: int, D: int, F2: int,
+                 pool1: int = 4, pool2: int = 8, dropout: float = 0.3):
+        super().__init__()
+        self.firstconv = nn.Sequential(
+            nn.Conv2d(1, F1, (1, k1), padding=(0, k1 // 2), bias=False),
+            nn.BatchNorm2d(F1)
+        )
+        self.depthwise = nn.Sequential(
+            nn.Conv2d(F1, F1 * D, (Chans, 1), groups=F1, bias=False),
+            nn.BatchNorm2d(F1 * D)
+        )
+        self.separable = nn.Sequential(
+            nn.Conv2d(F1 * D, F1 * D, (1, k2), padding=(0, k2 // 2), groups=F1 * D, bias=False),
+            nn.Conv2d(F1 * D, F2, (1, 1), bias=False),
+            nn.BatchNorm2d(F2)
+        )
+        self.elu = nn.ELU()
+        self.pool1 = nn.AvgPool2d((1, pool1))
+        self.pool2 = nn.AvgPool2d((1, pool2))
+        self.drop = nn.Dropout(dropout)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Linear(F2, n_classes)
+
+    def forward(self, x):
+        x = self.firstconv(x)
+        x = self.depthwise(x); x = self.elu(x); x = self.pool1(x); x = self.drop(x)
+        x = self.separable(x); x = self.elu(x); x = self.pool2(x); x = self.drop(x)
+        x = self.gap(x).squeeze(-1).squeeze(-1)
+        x = self.classifier(x)
+        return x
+
+# ========================= 유틸 =========================
+def extract_subject_id(file_path: str) -> Optional[str]:
+    m = re.search(r"(sub-\d+)", file_path)
+    return m.group(1) if m else None
+
+def truthy(x) -> bool:
+    if isinstance(x, bool): return x
+    if x is None: return False
+    return str(x).strip().lower() in ('1','true','on','yes','y')
+
+def _strip_prefix(sd: dict, prefixes=("module.","model.")) -> dict:
+    out = {}
+    for k, v in sd.items():
+        kk = k
+        for p in prefixes:
+            if kk.startswith(p): kk = kk[len(p):]
+        out[kk] = v
+    return out
+
+def _load_state_dict(weights_path: str, map_location: str):
+    ext = os.path.splitext(weights_path)[-1].lower()
+    if ext == ".safetensors":
+        if safe_load_file is None:
+            raise RuntimeError("pip install safetensors 필요")
+        sd = dict(safe_load_file(weights_path))
     else:
-        env_max = np.abs(segs).mean(axis=2)
-    lf_med = np.median(env_max, axis=1)              # (N,)
-    lf_z = _robust_z(lf_med)
-
-    bad = (ptp_z > thr_ptp_z) | (lf_z > thr_lf_z)
-    return {"bad": bad}
-
-def _two_min_need(win_sec: float, hop_sec: float) -> int:
-    return int((120.0 - win_sec) / hop_sec) + 1
-
-def _best_window_start(segs: np.ndarray, need: int, srate: int) -> int:
-    N = segs.shape[0]
-    if N < need: return -1
-    qbad = _segment_quality_metrics(segs, srate=srate)["bad"]
-    best_s, best_score = -1, -1.0
-    for s in range(0, N - need + 1):
-        e = s + need
-        score = 1.0 - float(qbad[s:e].mean())
-        if score > best_score:
-            best_score, best_s = score, s
-    return best_s
-
-# ========================= 소프트맥스 & 유틸 =========================
-def _softmax_np(logits: np.ndarray) -> np.ndarray:
-    logits = logits - logits.max(axis=1, keepdims=True)
-    e = np.exp(logits)
-    return e / (e.sum(axis=1, keepdims=True) + 1e-12)
-
-def extract_subject_id(file_path: str) -> str:
-    m = re.search(r"(sub-\d+)", file_path.replace("\\", "/"))
-    return m.group(1) if m else "unknown"
-
-def _canon_true_label(true_label, name_to_idx: Dict[str, int]) -> Optional[int]:
-    """
-    true_label: "CN"/"AD"/"FTD" 또는 "C"/"A"/"F" 또는 0/1/2
-    """
-    if true_label is None:
-        return None
-    if isinstance(true_label, (int, np.integer)):
-        gi = int(true_label)
-        return gi if gi in name_to_idx.values() else None
-    tl = str(true_label).strip().upper()
-    if tl in ("C", "A", "F"):
-        tl = {"C":"CN","A":"AD","F":"FTD"}[tl]
-    return name_to_idx.get(tl, None)
-
-# ========================= 추론 루틴 =========================
-@torch.no_grad()
-def predict_from_eeglab_file(file_path: str,
-                             model: nn.Module,
-                             cfg: dict,
-                             device: Optional[str] = None,
-                             true_label: Union[str, int, None] = None,
-                             enforce_two_minutes: bool = True):
-    """
-    EEGLAB .set 파일을 읽어 '정확히 2분' 윈도우에서 세그먼트 예측.
-    - prob_mean: 세그 확률의 단순 평균
-    - subject_probs: (품질가중) 로짓 평균 → softmax  → 최종 판정
-    """
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # 채널/샘플링/윈도우 설정
-    pick_channels = cfg.get("pick_channels", ["Fz","C3","Cz","C4","Pz","T5","T6","O1"])
-    srate   = int(cfg.get("target_srate", int(cfg.get("target_srate", 250))))
-    win_sec = float(cfg.get("segment_sec", 5.0))
-    hop_sec = float(cfg.get("eval_hop_sec", 2.5))
-
-    # 라벨 맵
-    idx_to_label: Dict[int, str] = cfg.get("idx_to_label", {0: "CN", 1: "AD", 2: "FTD"})
-    def _lab(i: int) -> str:
-        return idx_to_label.get(i) or idx_to_label.get(str(i)) or f"class_{i}"
-    name_to_idx = {(_lab(i)).upper(): i for i in range(int(cfg.get("n_classes", 3)))}
-
-    # 로드 + 전처리 + 채널 매칭
-    raw  = mne.io.read_raw_eeglab(file_path, preload=True, verbose=False)
-    # 필터/리샘플/CAR
-    raw = _read_filter_resample(file_path, cfg)
-    data, ch_map, raw_chs = _get_data_fixed_channels(raw, pick_channels)   # 매핑/원본채널도 받음
-    segs = _segment_array(data, srate=srate, win_sec=win_sec, hop_sec=hop_sec)
-
-    need = _two_min_need(win_sec, hop_sec)
-    if segs.shape[0] < need:
-        if enforce_two_minutes:
-            raise ValueError(f"파일 길이가 부족합니다: 2분 커버 need={need}, actual={segs.shape[0]}")
+        obj = torch.load(weights_path, map_location=map_location)
+        if isinstance(obj, dict):
+            for k in ["state_dict","model_state_dict","weights","params","model","net"]:
+                if k in obj and isinstance(obj[k], dict):
+                    sd = obj[k]; break
+            else:
+                # 순수 state_dict
+                if all(isinstance(v, torch.Tensor) for v in obj.values()):
+                    sd = obj
+                elif isinstance(obj.get("model", None), nn.Module):
+                    sd = obj["model"].state_dict()
+                else:
+                    raise RuntimeError("state_dict를 찾지 못했습니다.")
+        elif isinstance(obj, nn.Module):
+            sd = obj.state_dict()
         else:
-            need = segs.shape[0]
+            raise RuntimeError("지원되지 않는 가중치 포맷")
+    return _strip_prefix(sd)
 
-    s_best = _best_window_start(segs, need=need, srate=srate)
-    if s_best < 0: s_best = 0
-    block = segs[s_best:s_best+need]  # (need, C, win)
+def _looks_compat(sd: dict) -> bool:
+    # firstconv.0.weight 존재 여부로 판정
+    return any(k.startswith("firstconv.0.weight") or k.endswith("firstconv.0.weight") for k in sd.keys())
 
-    # 추론
-    X = torch.from_numpy(block)[:, None, :, :].to(device)
-    logits = []
-    bs = int(cfg.get("inference_batch_size", 64))
-    for p in range(0, X.size(0), bs):
-        logits.append(model(X[p:p+bs]).detach().cpu().numpy().astype(np.float32))
-    logits = np.concatenate(logits, axis=0)
-    probs  = _softmax_np(logits)
-    pred   = probs.argmax(axis=1)
+def _infer_hparams_from_sd(sd: dict, chans: int) -> Tuple[int,int,int,int,int,int,int]:
+    """
+    F1, D, F2, k1, k2, pool1, pool2 추정
+    - k1: firstconv.0.weight[..., k1]
+    - k2: separable.0.weight[..., k2]  ✔ (수정 포인트)
+    - F1: firstconv.0.weight.shape[0]
+    - D : depthwise.0.weight.shape[0] // F1
+    - F2: classifier.weight.shape[1] (우선) / separable.1.weight.shape[0] (보조)
+    - pool1/pool2: 일반적으로 (4,8) — sd로 직접 추정 어려워 기본값 사용
+    """
+    # 기본값(선생님 코드에 맞춤)
+    F1, D, F2, k1, k2, pool1, pool2 = 32, 2, 64, 250, 32, 4, 8
+    try:
+        if "firstconv.0.weight" in sd:
+            w = sd["firstconv.0.weight"]           # [F1, 1, 1, k1]
+            F1 = int(w.shape[0]); k1 = int(w.shape[-1])
+        if "depthwise.0.weight" in sd:
+            w = sd["depthwise.0.weight"]           # [F1*D, 1, chans, 1]
+            D = int(w.shape[0] // F1)
+        if "separable.0.weight" in sd:
+            w = sd["separable.0.weight"]           # [F1*D, 1, 1, k2]
+            k2 = int(w.shape[-1])                  # ✔ k2를 체크포인트에서 직접 추정
+        if "separable.1.weight" in sd:
+            w = sd["separable.1.weight"]           # [F2, F1*D, 1, 1]
+            F2 = int(w.shape[0])
+        if "classifier.weight" in sd:
+            F2 = int(sd["classifier.weight"].shape[1])  # 최종 확정
+    except Exception:
+        pass
+    return F1, D, F2, k1, k2, pool1, pool2
 
-    # 세그먼트 요약
-    n_classes = int(cfg.get("n_classes", 3))
-    counts = np.bincount(pred, minlength=n_classes)
-    maj_idx = int(np.argmax(counts))
-    maj_label = _lab(maj_idx)
+def _load_hf_config(repo_dir: str) -> dict:
+    # config.json이 있으면 읽어 하이퍼파라미터 보정
+    cfg_path = os.path.join(repo_dir, "config.json")
+    if os.path.exists(cfg_path):
+        try:
+            import json
+            with open(cfg_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
 
-    prob_mean = probs.mean(axis=0)
-    prob_map = {_lab(i): float(prob_mean[i]) for i in range(prob_mean.shape[0])}
-    counts_map = {_lab(i): int(counts[i]) for i in range(counts.shape[0]) if counts[i] > 0}
+def _hf_download(device_type: str, channel_len: int, ver: str, token: Optional[str]) -> Tuple[str, dict]:
+    repo_id = f"ardor924/EEGNetV4-{channel_len}ch-{device_type}-Ver{ver}"
+    allow_patterns = ["*.pt", "*.pth", "*.bin", "*.safetensors", "config.json"]
+    local_dir = snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns, token=token)
+    # 가중치 파일 선택
+    preferred_exts = (".pt",".pth",".bin",".safetensors")
+    weights = []
+    for root, _, files in os.walk(local_dir):
+        for fn in files:
+            if fn.lower().endswith(preferred_exts):
+                weights.append(os.path.join(root, fn))
+    if not weights:
+        raise FileNotFoundError(f"[HF] {repo_id} 에 가중치 파일이 없습니다.")
+    weights.sort()
+    cfg = _load_hf_config(local_dir)
+    return weights[0], cfg
 
-    # subject-level (품질가중 로짓 평균)
-    qm = _segment_quality_metrics(block, srate=srate)
-    w  = np.where(qm["bad"], 1e-3, 1.0).astype(np.float32)
-    subj_logits = (logits * w[:, None]).sum(axis=0) / (float(w.sum()) + 1e-8)
-    subj_probs  = np.exp(subj_logits - np.max(subj_logits)); subj_probs /= (subj_probs.sum() + 1e-12)
-    subject_probs_map = {_lab(i): float(subj_probs[i]) for i in range(n_classes)}
-    subject_pred_idx   = int(np.argmax(subj_probs))
-    subject_pred_label = _lab(subject_pred_idx)
+# ========================= 엔진 =========================
+class EEGInferenceEngine:
+    def __init__(self, device_type: str = 'muse',
+                 version: Optional[str] = None,
+                 torch_device: Optional[str] = None,
+                 hf_token: Optional[str] = None):
+        self.device_type = device_type.lower().strip()
+        if self.device_type not in CHANNEL_GROUPS:
+            raise ValueError(f"Unknown device_type '{self.device_type}'. Choose one of {list(CHANNEL_GROUPS.keys())}")
+        self.channels = CHANNEL_GROUPS[self.device_type]
+        self.samples_per_seg = int(TARGET_SRATE * SEG_SECONDS)
+        self.hop_samples = int(TARGET_SRATE * EVAL_HOP_SEC)
+        self.torch_device = torch_device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # GT 처리(있을 때만)
-    gt_idx = _canon_true_label(true_label, name_to_idx)
-    subject_acc = None; seg_acc = None; true_label_canon = None
-    if gt_idx is not None and 0 <= gt_idx < n_classes:
-        true_label_canon = _lab(gt_idx)
-        subject_acc = float(1.0 if subject_pred_idx == gt_idx else 0.0)
-        seg_acc = float(np.mean(pred == gt_idx))
+        self.version = str(version or os.getenv("EEG_WEIGHTS_VER", "14")).strip()
+        self.hf_token = hf_token or os.getenv("HF_TOKEN", None)
 
-    return {
-        "file_path": os.path.abspath(file_path),
-        "subject_id": extract_subject_id(file_path),
+        # 1) HF에서 다운로드 + config 로딩
+        weights_path, cfg = _hf_download(
+            device_type=self.device_type,
+            channel_len=len(self.channels),
+            ver=self.version,
+            token=self.hf_token,
+        )
 
-        # 세그먼트 기준
-        "n_segments": int(block.shape[0]),
-        "segment_counts": counts_map,
-        "segment_majority_index": maj_idx,
-        "segment_majority_label": maj_label,
-        "segment_accuracy": seg_acc,
+        # 2) state_dict 로딩 후 구조/하이퍼 추정
+        sd = _load_state_dict(weights_path, map_location=self.torch_device)
+        if not _looks_compat(sd):
+            raise RuntimeError("이 체크포인트는 지원되는 키(firstconv/depthwise/separable/classifier)가 아닙니다.")
 
-        # 세그 평균 확률
-        "prob_mean": prob_map,
+        F1, D, F2, k1, k2, pool1, pool2 = _infer_hparams_from_sd(sd, chans=len(self.channels))
+        # config.json 값이 있으면 우선 적용(안전 보정)
+        k1 = int(cfg.get("kernel_length", k1))
+        k2 = int(cfg.get("sep_length", k2))
+        F1 = int(cfg.get("F1", F1))
+        D  = int(cfg.get("D", D))
+        pool1 = int(cfg.get("pool1", pool1))
+        pool2 = int(cfg.get("pool2", pool2))
+        dropout = float(cfg.get("dropout_rate", 0.3))
 
-        # ✅ subject-level
-        "subject_probs": subject_probs_map,
-        "subject_pred_index": subject_pred_idx,
-        "subject_pred_label": subject_pred_label,
-        "subject_accuracy": subject_acc,
-        "true_label": true_label_canon,
+        # 3) 모델 구성/로드
+        self.model = EEGNetV4Compat(
+            n_classes=len(CLASS_NAMES),
+            Chans=len(self.channels),
+            k1=k1, k2=k2, F1=F1, D=D, F2=F2,
+            pool1=pool1, pool2=pool2, dropout=dropout
+        ).to(self.torch_device)
+        self.model.load_state_dict(sd, strict=True)
+        self.model.eval()
 
-        # 채널/윈도 정보 (디버깅에 유용)
-        "channels_used": list(pick_channels),
-        "channels_map": ch_map,                # [{"target": "T5", "picked": "TP7"}, ...]
-        "raw_channel_names": raw_chs[:50],     # 너무 길면 50개 제한
-        "window": {"start": int(s_best), "need": int(need)},
-    }
+    # -------- 전처리 --------
+    def load_raw_fixed_channels(self, file_path: str):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"EEG file not found: {file_path}")
+        raw = mne.io.read_raw_eeglab(file_path, preload=True, verbose='ERROR')
+        missing = [ch for ch in self.channels if ch not in raw.ch_names]
+        if missing:
+            raise ValueError(f"Channels missing in file: {missing}\nPresent: {raw.ch_names}\nExpected: {self.channels}")
+        raw.pick_channels(self.channels)
+        raw.filter(LOW_FREQ, HIGH_FREQ, fir_design='firwin', verbose='ERROR')
+        raw.resample(TARGET_SRATE)
+        return raw
+
+    def _segment_array(self, data: np.ndarray) -> np.ndarray:
+        C, T = data.shape
+        win = self.samples_per_seg
+        hop = max(1, self.hop_samples)
+        if T < win:
+            return np.empty((0, C, win), dtype=np.float32)
+        idxs = list(range(0, T - win + 1, hop))
+        segs = np.stack([data[:, i:i+win] for i in idxs], axis=0).astype(np.float32)
+        return segs
+
+    def _per_record_zscore(self, segs: np.ndarray) -> np.ndarray:
+        mean = segs.mean(axis=(0,2), keepdims=True)
+        std = segs.std(axis=(0,2), keepdims=True) + 1e-7
+        return (segs - mean) / std
+
+    def _segment_quality_metrics(self, segs: np.ndarray) -> Dict[str, np.ndarray]:
+        std_per_seg = segs.std(axis=(1,2))
+        med = np.median(std_per_seg)
+        bad = std_per_seg < (0.2 * med + 1e-8)
+        return {"bad": bad}
+
+    @torch.no_grad()
+    def _logits_for_segments(self, segs: np.ndarray) -> np.ndarray:
+        if segs.shape[0] == 0:
+            return np.empty((0, len(CLASS_NAMES)), dtype=np.float32)
+        x = torch.from_numpy(segs)[:, None, :, :].to(self.torch_device, non_blocking=True)
+        outs = []
+        for i in range(0, x.size(0), BATCH_SIZE):
+            outs.append(self.model(x[i:i+BATCH_SIZE]).detach().cpu().numpy().astype(np.float32))
+        return np.concatenate(outs, axis=0)
+
+    @staticmethod
+    def _softmax_np(x: np.ndarray) -> np.ndarray:
+        x = x - np.max(x, axis=-1, keepdims=True)
+        e = np.exp(x)
+        return e / (np.sum(e, axis=-1, keepdims=True) + 1e-12)
+
+    def _choose_best_window(self, logits_all: np.ndarray, need_eval: int) -> Tuple[int, int]:
+        if logits_all.shape[0] < need_eval:
+            return 0, logits_all.shape[0]
+        probs = self._softmax_np(logits_all)
+        top1 = probs.max(axis=1)
+        cumsum = np.concatenate([[0.0], np.cumsum(top1)])
+        best, best_sum = 0, -1.0
+        for s in range(0, len(top1) - need_eval + 1):
+            sm = cumsum[s+need_eval] - cumsum[s]
+            if sm > best_sum:
+                best_sum, best = sm, s
+        return best, need_eval
+
+    # -------- 엔드투엔드 --------
+    def infer(self, file_path: str,
+              subject_id: Optional[str] = None,
+              true_label: Optional[str] = None,
+              enforce_two_minutes: bool = True) -> Dict:
+        raw = self.load_raw_fixed_channels(file_path)
+        data = raw.get_data()  # (C, T)
+        segs = self._segment_array(data)
+
+        need_eval = int((WINDOW_NEED_SECONDS - SEG_SECONDS) / EVAL_HOP_SEC) + 1
+        N = segs.shape[0]
+        if enforce_two_minutes and N < need_eval:
+            raise ValueError(f"Recording too short for 2-minute window: need {need_eval} segments, got {N}")
+
+        if EVAL_PER_RECORD_ZSCORE:
+            segs = self._per_record_zscore(segs)
+
+        logits_all = self._logits_for_segments(segs)
+        if N == 0:
+            raise ValueError("No segments could be formed from the recording.")
+
+        s_best, use = (0, N) if N < need_eval else self._choose_best_window(logits_all, need_eval)
+        block_logits = logits_all[s_best:s_best+use]
+        block_segs   = segs[s_best:s_best+use]
+
+        qm = self._segment_quality_metrics(block_segs)
+        w = np.where(qm["bad"], 1e-3, 1.0).astype(np.float32)
+
+        logits_cal  = apply_calibration(block_logits)
+        logits_bias = logits_cal - DECISION_BIAS_VEC[None, :]
+        probs       = self._softmax_np(logits_bias)
+
+        # -------------------------------
+        # 세그먼트 단위
+        # -------------------------------
+        y_pred_seg = probs.argmax(axis=1)
+        counts = {CLASS_NAMES[i]: int((y_pred_seg == i).sum()) for i in range(len(CLASS_NAMES))}
+        majority_idx = int(np.bincount(y_pred_seg, minlength=len(CLASS_NAMES)).argmax())
+        majority_label = CLASS_NAMES[majority_idx]
+
+        # -------------------------------
+        # Subject-level 계산
+        # -------------------------------
+        w_sum = float(w.sum()) + 1e-8
+        subj_logit = (logits_bias * w[:, None]).sum(axis=0) / w_sum
+        subj_prob  = self._softmax_np(subj_logit[None, :])[0]
+        subject_probs = {CLASS_NAMES[i]: float(subj_prob[i]) for i in range(len(CLASS_NAMES))}
+
+        subj_pred_idx = int(subj_prob.argmax())
+        subj_pred_label = CLASS_NAMES[subj_pred_idx]
+
+        # -------------------------------
+        # Accuracy 계산
+        # -------------------------------
+        segment_acc = None
+        subject_acc = None
+        if true_label:
+            tl = str(true_label).strip().upper()
+            if tl in ("C","A","F"):
+                tl = {"C":"CN","A":"AD","F":"FTD"}[tl]
+            if tl in CLASS_NAMES:
+                tl_idx = CLASS_NAMES.index(tl)
+                segment_acc = float((y_pred_seg == tl_idx).mean())
+                subject_acc = 1.0 if subj_pred_label == tl else 0.0
+
+        # -------------------------------
+        # 결과 반환
+        # -------------------------------
+        return {
+            "channels_used": self.channels,
+            "file_path": file_path,
+            "subject_id": subject_id or extract_subject_id(file_path),
+            "n_segments": int(block_segs.shape[0]),
+
+            # Probabilities
+            "prob_mean": subject_probs,              # (이전 호환성용)
+            "subject_probs": subject_probs,          # ✅ 명확히 subject-level
+            "segment_counts": counts,
+
+            # Labels
+            "segment_majority_index": majority_idx,
+            "segment_majority_label": majority_label,
+            "subject_pred_label": subj_pred_label,   # ✅ 최종 subject-level label
+
+            # Accuracy
+            "segment_accuracy": segment_acc,
+            "subject_accuracy": subject_acc,
+            "true_label": true_label,
+
+            # Info
+            "window": {"start": int(s_best * EVAL_HOP_SEC), "need": int(WINDOW_NEED_SECONDS)}
+        }
