@@ -23,7 +23,6 @@ app = Flask(__name__)
 
 # 간단 엔진 캐시(동일 (device, ver, csv_order) 조합 재사용)
 _ENGINES = {}
-VER = '22'
 
 def _truthy(v, default=True):
     if v is None: return default
@@ -46,7 +45,7 @@ def infer():
         if device not in CHANNEL_GROUPS:
             return jsonify({"status":"error","error":f"Unsupported device '{device}'"}), 400
         
-        ver = str(p.get("ver") or os.getenv("EEG_WEIGHTS_VER",VER)).strip()
+        ver = str(p.get("ver") or os.getenv("EEG_WEIGHTS_VER","14")).strip()
         subject_id = p.get("subject_id")
         true_label = p.get("true_label")
         enforce_two_minutes = _truthy(p.get("enforce_two_minutes"), True)
