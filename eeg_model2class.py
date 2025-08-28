@@ -35,7 +35,8 @@ BATCH_SIZE            = int(os.getenv("EEG_BATCH_SIZE", "64"))
 # 2클 기본값(필요 시 ENV로 덮어쓰기)
 DEFAULT_DEVICE  = os.getenv("EEG_DEVICE_DEFAULT", "muse").strip().lower()
 DEFAULT_VER     = os.getenv("EEG_WEIGHTS_VER", "52").strip()
-DEFAULT_COMMENT = "2Class"
+DEFAULT_COMMENT = "2Class-extradataset"
+# DEFAULT_COMMENT = "2Class"
 
 # ========================= 모델 =========================
 class EEGNetV4Compat(nn.Module):
