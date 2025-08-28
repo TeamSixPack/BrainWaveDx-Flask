@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 eeg_model.py
-- Hugging Face 가중치 자동 다운로드(레포 규칙: ardor924/EEGNetV4-{ch}ch-{device}-Ver{ver})
-- MuseLab CSV 로더 통합(채널 재배열 → 1–40 Hz 필터 → 256→250 Hz 리샘플링)
-- Part10 스타일 추론(5s/2.5s, best 2분 윈도우, per-record z-score, 품질가중)
+- Hugging Face 가중치 자동 다운로드
+  🔹 신규 규칙: ardor924/EEGNetV4-{ch}ch-{device}-{ver}-{comment}
+     - comment 비어있으면: ardor924/EEGNetV4-{ch}ch-{device}-{ver}
+  🔸 레거시 호환: 실패 시 ardor924/EEGNetV4-{ch}ch-{device}-Ver{ver} 재시도
+- MuseLab CSV 로더(뮤즈 전용) + 범용 CSV 로더(모든 기기) + EEGLAB .set 로더
+- 추론: 5s/2.5s, best 2분 윈도우, per-record z-score, 품질가중
 - 캘리브레이션/바이어스(온도, 프라이어, 결정바이어스) 적용
-- .csv / .set 모두 지원
 """
 from __future__ import annotations
 import os, re, json
@@ -28,19 +30,23 @@ CHANNEL_GROUPS: Dict[str, List[str]] = {
     'total19': ['Fp1','Fp2','F7','F3','Fz','F4','F8','T3','C3','Cz','C4','T4','T5','P3','Pz','P4','T6','O1','O2'],
 }
 
-LOW_FREQ, HIGH_FREQ = 1.0, 40.0
-TARGET_SRATE = 250
-SEG_SECONDS, EVAL_HOP_SEC = 5.0, 2.5  # 50% overlap
-WINDOW_NEED_SECONDS = 120
-BATCH_SIZE = int(os.getenv("EEG_BATCH_SIZE", "64"))
+LOW_FREQ, HIGH_FREQ   = 1.0, 40.0
+TARGET_SRATE          = 250
+SEG_SECONDS           = 5.0
+EVAL_HOP_SEC          = 2.5  # 50% overlap
+WINDOW_NEED_SECONDS   = 120
+BATCH_SIZE            = int(os.getenv("EEG_BATCH_SIZE", "64"))
+
+# ===== 안전한 모듈 기본값(ENV → 하드코딩) =====
+# DEFAULT_DEVICE  = os.getenv("EEG_DEVICE_DEFAULT", "muse").strip().lower()
+# DEFAULT_VER     = os.getenv("EEG_WEIGHTS_VER", "29").strip()
+# DEFAULT_COMMENT = os.getenv("EEG_WEIGHTS_COMMENT", "").strip()
+DEFAULT_DEVICE  = os.getenv("EEG_DEVICE_DEFAULT", "muse").strip().lower()
+DEFAULT_VER     = os.getenv("EEG_WEIGHTS_VER", "29").strip()
+DEFAULT_COMMENT = os.getenv("EEG_WEIGHTS_COMMENT", "").strip()
 
 # ========================= 모델 정의(Compat) =========================
 class EEGNetV4Compat(nn.Module):
-    """
-    체크포인트 키 네이밍(firstconv/depthwise/separable/classifier)과 호환.
-    k1(첫 conv 커널), k2(separable depthwise 커널), F1/D/F2, pool, dropout을 주입형으로 설정.
-    최종 GAP→Linear(F2→n_classes) 구조로 classifier.in_features=F2 고정.
-    """
     def __init__(self, n_classes: int, Chans: int,
                  k1: int, k2: int, F1: int, D: int, F2: int,
                  pool1: int = 4, pool2: int = 8, dropout: float = 0.3):
@@ -119,7 +125,7 @@ def _infer_hparams_from_sd(sd: dict, chans: int):
         if "separable.0.weight" in sd: k2 = int(sd["separable.0.weight"].shape[-1])
         if "separable.1.weight" in sd: F2 = int(sd["separable.1.weight"].shape[0])
         if "classifier.weight" in sd:  F2 = int(sd["classifier.weight"].shape[1])
-    except:  # pragma: no cover
+    except:
         pass
     return F1, D, F2, k1, k2, p1, p2
 
@@ -145,28 +151,78 @@ def _hf_download(repo_id: str, token: Optional[str]):
                 pass
     return weights[0], cfg
 
-# ========================= CSV 로더 =========================
-# CSV 채널 정의: eeg_1..4 = [TP9, AF7, AF8, TP10]
-# 학습 순서: ['T5','T6','F7','F8'] = [TP9, TP10, AF7, AF8]
-_MUSE_CSV_ORDER_DEFAULT = ("TP9","AF7","AF8","TP10")
-_MUSE_TRAIN_ORDER = ("T5","T6","F7","F8")
-_MUSE_MAP_DEFAULT = {"TP9":"T5","TP10":"T6","AF7":"F7","AF8":"F8"}
+def _build_repo_id(ch_len: int, device: str, ver: str, comment: Optional[str]) -> str:
+    base = f"ardor924/EEGNetV4-{ch_len}ch-{device}-{ver}"
+    if comment is not None and str(comment).strip() != "":
+        return f"{base}-{comment.strip()}"
+    return base
+
+# ========================= CSV 로더 (뮤즈 전용) =========================
+_MUSE_CSV_ORDER_DEFAULT = ("TP9","AF7","AF8","TP10")  # 물리 순서
+_MUSE_TRAIN_ORDER       = ("T5","T6","F7","F8")       # 학습 순서
 
 def _parse_csv_order_env(env_val: Optional[str]) -> Tuple[str,str,str,str]:
-    """
-    EEG_CSV_ORDER 환경변수 파싱: 예) "TP9,AF7,AF8,TP10"
-    """
     if not env_val:
         return _MUSE_CSV_ORDER_DEFAULT
     items = [s.strip().upper() for s in env_val.split(",") if s.strip()]
-    if len(items) != 4 or set(items) != {"TP9","AF7","AF8","TP10"}:
+    if len(items) != 4 or not set(items).issubset({"TP9","AF7","AF8","TP10"}):
         return _MUSE_CSV_ORDER_DEFAULT
     return tuple(items)  # type: ignore
+
+def _robust_median_dt(ts: np.ndarray) -> float:
+    dt = np.diff(ts)
+    dt = dt[dt > 0]
+    if dt.size == 0:
+        raise ValueError("Invalid timestamps: non-increasing or empty.")
+    q1, q3 = np.quantile(dt, [0.25, 0.75])
+    iqr = max(1e-9, q3 - q1)
+    low = q1 - 1.5 * iqr
+    high = q3 + 1.5 * iqr
+    dt_clipped = dt[(dt >= max(1e-4, low)) & (dt <= min(1.0, high))]
+    if dt_clipped.size == 0:
+        dt_clipped = dt
+    return float(np.median(dt_clipped))
+
+def _apply_car_np(X: np.ndarray) -> np.ndarray:
+    return X - X.mean(axis=0, keepdims=True)
+
+def _detect_mains_hz_raw(raw: mne.io.BaseRaw, ratio_thresh: float = 3.0) -> int:
+    try:
+        psd = mne.time_frequency.psd_welch(raw, fmin=45, fmax=65, n_fft=4096,
+                                           n_overlap=1024, verbose="ERROR")
+        if isinstance(psd, tuple):
+            psd_vals, freqs = psd
+        else:
+            psd_vals = psd.get_data(); freqs = psd.freqs
+        med = np.median(psd_vals, axis=0)
+        def band_pow(f0, w=1.5):
+            m = (freqs >= f0 - w) & (freqs <= f0 + w)
+            return np.median(med[m]) if m.any() else 0.0
+        p50 = band_pow(50.0); p60 = band_pow(60.0)
+        base = np.median(med[(freqs >= 46) & (freqs <= 64)])
+        r50 = p50 / (base + 1e-9); r60 = p60 / (base + 1e-9)
+        if r50 >= ratio_thresh and r50 >= r60: return 50
+        if r60 >= ratio_thresh and r60 >  r50: return 60
+    except Exception:
+        pass
+    return 0
+
+def _maybe_notch(raw: mne.io.BaseRaw):
+    env = os.getenv("EEG_MAINS", "").strip()
+    mains = 0
+    if env in ("50","60"):
+        mains = int(env)
+    else:
+        mains = _detect_mains_hz_raw(raw, ratio_thresh=3.0)
+    if mains in (50, 60):
+        try:
+            raw.notch_filter(freqs=[mains], verbose="ERROR")
+        except Exception:
+            pass
 
 def _load_muselab_csv(file_path: str,
                       csv_order: Optional[Tuple[str,str,str,str]] = None) -> Tuple[np.ndarray, float]:
     df = pd.read_csv(file_path)
-    # 필수 컬럼 점검
     need_cols = ['eeg_1','eeg_2','eeg_3','eeg_4','timestamps']
     for c in need_cols:
         if c not in df.columns:
@@ -174,75 +230,134 @@ def _load_muselab_csv(file_path: str,
 
     sub = df[need_cols].dropna()
     ts = sub["timestamps"].to_numpy(dtype=np.float64)
-    # 타임스탬프 정렬/중복 제거
     if np.any(np.diff(ts) <= 0):
         sub = sub.sort_values("timestamps")
         ts = sub["timestamps"].to_numpy(dtype=np.float64)
 
-    dt = np.diff(ts)
-    dt_med = np.median(dt[dt > 0])
-    sfreq_est = float(1.0 / dt_med)
+    dt_med = _robust_median_dt(ts)
+    sfreq_est = float(1.0 / max(dt_med, 1e-6))
 
-    X_raw = sub[['eeg_1','eeg_2','eeg_3','eeg_4']].to_numpy(dtype=np.float32).T  # (4, T)
+    X_raw = sub[['eeg_1','eeg_2','eeg_3','eeg_4']].to_numpy(dtype=np.float32).T
 
-    # 채널 재배열: 입력 CSV의 물리 채널 순서 → 학습 채널 순서
-    # csv_order가 없으면: (TP9,AF7,AF8,TP10) 으로 간주
     order = csv_order or _parse_csv_order_env(os.getenv("EEG_CSV_ORDER"))
-    idx_by_name = {"TP9":0, "AF7":1, "AF8":2, "TP10":3}
-    # 학습 순서 T5,T6,F7,F8 ← [TP9,TP10,AF7,AF8]
-    X_ord = np.stack([
-        X_raw[idx_by_name["TP9"], :],   # T5
-        X_raw[idx_by_name["TP10"], :],  # T6
-        X_raw[idx_by_name["AF7"], :],   # F7
-        X_raw[idx_by_name["AF8"], :],   # F8
-    ], axis=0)
+    idx_by_name = {name: i for i, name in enumerate(order)}
+    try:
+        X_ord = np.stack([
+            X_raw[idx_by_name["TP9"], :],   # T5
+            X_raw[idx_by_name["TP10"], :],  # T6
+            X_raw[idx_by_name["AF7"], :],   # F7
+            X_raw[idx_by_name["AF8"], :],   # F8
+        ], axis=0)
+    except KeyError as e:
+        raise ValueError(f"csv_order is invalid or missing channel: {e}. Got order={order}")
 
-    # RawArray → 필터/리샘플
     info = mne.create_info(list(_MUSE_TRAIN_ORDER), sfreq=sfreq_est, ch_types='eeg')
     raw = mne.io.RawArray(X_ord, info, verbose='ERROR')
+
+    _maybe_notch(raw)
+    raw.filter(LOW_FREQ, HIGH_FREQ, fir_design='firwin', verbose='ERROR')
+
+    if abs(sfreq_est - TARGET_SRATE) > 1e-3:
+        raw.resample(TARGET_SRATE, verbose='ERROR')
+
+    try:
+        raw.set_eeg_reference('average', projection=False, verbose='ERROR')
+    except Exception:
+        pass
+
+    return raw.get_data(), TARGET_SRATE  # (4, T_250), 250
+
+# ========================= 일반 CSV 로더 (모든 기기) =========================
+def _norm(name: str) -> str:
+    """열 이름 정규화: 대문자 + 영숫자만 유지 (예: 'eeg_Fp1' → 'FP1')."""
+    import re as _re
+    return _re.sub(r'[^A-Z0-9]', '', str(name).upper())
+
+def _load_device_csv(file_path: str, channels: List[str]) -> Tuple[np.ndarray, float]:
+    """
+    범용 CSV → (학습 채널 순서로) C x T @ 250 Hz
+    - CSV에 각 채널명이 열로 존재해야 합니다(대/소문자/특수문자 무시).
+    - 'timestamps' 열이 없으면 샘플링레이트는 ENV EEG_CSV_SFREQ(기본 250)를 사용합니다.
+    처리: 채널 선택/정렬 → RawArray → (노치) → 1~40Hz → 250Hz 리샘플 → CAR
+    """
+    df = pd.read_csv(file_path)
+
+    # 타임스탬프 처리(선택)
+    if 'timestamps' in df.columns:
+        sub = df.dropna(subset=['timestamps']).copy()
+        ts = sub['timestamps'].to_numpy(dtype=np.float64)
+        if np.any(np.diff(ts) <= 0):
+            sub = sub.sort_values('timestamps')
+            ts = sub['timestamps'].to_numpy(dtype=np.float64)
+        dt_med = _robust_median_dt(ts)
+        sfreq_est = float(1.0 / max(dt_med, 1e-6))
+    else:
+        sub = df.copy()
+        sfreq_est = float(os.getenv("EEG_CSV_SFREQ", TARGET_SRATE))
+
+    # 열 이름 정규화 맵
+    norm2orig = { _norm(c): c for c in sub.columns }
+
+    # 요청 채널(정규화 후) → 실제 열 매핑
+    X_list, missing = [], []
+    for ch in channels:
+        key = _norm(ch)  # 예: 'Fz' -> 'FZ'
+        if key in norm2orig:
+            X_list.append(sub[norm2orig[key]].to_numpy(dtype=np.float32))
+        else:
+            # 흔한 접두사/변형도 시도: 'EEGFZ', 'FZUV' 등
+            cand = None
+            for k, orig in norm2orig.items():
+                if k.endswith(key):
+                    cand = orig; break
+            if cand is not None:
+                X_list.append(sub[cand].to_numpy(dtype=np.float32))
+            else:
+                missing.append(ch)
+
+    if missing:
+        raise ValueError(
+            "CSV에 필요한 채널 열이 없습니다: "
+            f"{missing} / 기대 채널={channels}\n"
+            "※ CSV에 각 채널명이 실제 열로 존재해야 하며, 이름은 대소문자/특수문자 무시 매칭을 지원합니다."
+        )
+
+    # (C, T_raw)
+    X_ord = np.stack(X_list, axis=0)
+
+    # Raw 구성 → 노치 → 대역 → 리샘플 → CAR
+    info = mne.create_info(channels, sfreq=sfreq_est, ch_types='eeg')
+    raw = mne.io.RawArray(X_ord, info, verbose='ERROR')
+
+    _maybe_notch(raw)
     raw.filter(LOW_FREQ, HIGH_FREQ, fir_design='firwin', verbose='ERROR')
     if abs(sfreq_est - TARGET_SRATE) > 1e-3:
         raw.resample(TARGET_SRATE, verbose='ERROR')
-    return raw.get_data(), TARGET_SRATE  # (4, T_250), 250
+    try:
+        raw.set_eeg_reference('average', projection=False, verbose='ERROR')
+    except Exception:
+        pass
 
-# ========================= 세그먼트/보조 =========================
-def _segment_overlap(data: np.ndarray, win_sec: float, hop_sec: float, sfreq: float) -> np.ndarray:
-    C, T = data.shape
-    win = int(round(win_sec * sfreq))
-    hop = int(round(hop_sec * sfreq))
-    if T < win:
-        return np.empty((0, C, win), dtype=np.float32)
-    idxs = list(range(0, T - win + 1, hop))
-    return np.stack([data[:, i:i+win] for i in idxs], axis=0).astype(np.float32)
-
-def _per_record_zscore(segs: np.ndarray) -> np.ndarray:
-    mean = segs.mean(axis=(0,2), keepdims=True)
-    std  = segs.std(axis=(0,2), keepdims=True) + 1e-7
-    return (segs - mean) / std
-
-def _quality_weights(segs: np.ndarray) -> np.ndarray:
-    std = segs.std(axis=(1,2))
-    med = np.median(std) + 1e-8
-    return np.where(std < 0.2 * med, 1e-3, 1.0).astype(np.float32)
-
-def _softmax_np(x: np.ndarray) -> np.ndarray:
-    x = x - np.max(x, axis=-1, keepdims=True)
-    e = np.exp(x)
-    return e / (np.sum(e, axis=-1, keepdims=True) + 1e-12)
+    return raw.get_data(), TARGET_SRATE
 
 # ========================= 추론 엔진 =========================
 class EEGInferenceEngine:
     """
     device_type: 'muse' | 'hybrid_black' | 'union10' | 'total19'
     version    : HF 레포 Ver (문자열)
-    csv_order  : Muse CSV의 물리 채널 이름 순서 (TP9,AF7,AF8,TP10), 기본값은 환경변수 EEG_CSV_ORDER 또는 표준 순서
+    comment    : HF 레포 Comment (문자열, 비거나 ''이면 생략)
+    csv_order  : Muse CSV의 물리 채널 이름 순서 (TP9,AF7,AF8,TP10)
     """
-    def __init__(self, device_type: str = 'muse',
+    def __init__(self,
+                 device_type: Optional[str] = None,
                  version: Optional[str] = None,
+                 comment: Optional[str] = None,
                  torch_device: Optional[str] = None,
                  hf_token: Optional[str] = None,
                  csv_order: Optional[Tuple[str,str,str,str]] = None):
-        self.device_type = device_type.lower().strip()
+
+        # ---- 기본값 결정(요청 > ENV/모듈 기본) ----
+        self.device_type = (device_type or DEFAULT_DEVICE).strip().lower()
         if self.device_type not in CHANNEL_GROUPS:
             raise ValueError(f"Unknown device_type '{self.device_type}'. Choose one of {list(CHANNEL_GROUPS.keys())}")
 
@@ -250,18 +365,35 @@ class EEGInferenceEngine:
         self.samples_per_seg = int(TARGET_SRATE * SEG_SECONDS)
         self.hop_samples = int(TARGET_SRATE * EVAL_HOP_SEC)
         self.torch_device = torch_device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.version = str(version or os.getenv("EEG_WEIGHTS_VER", "14")).strip()
+
+        self.version = str(version or DEFAULT_VER).strip()
+        self.comment = comment if comment is not None else DEFAULT_COMMENT
+
         self.hf_token = hf_token or os.getenv("HF_TOKEN", None)
-        self.csv_order = csv_order  # only used for .csv inputs
+        self.csv_order = csv_order  # only used for Muse CSV
 
         # HF 가중치 로드
-        repo_id = f"ardor924/EEGNetV4-{len(self.channels)}ch-{self.device_type}-Ver{self.version}"
-        weights_path, cfg = _hf_download(repo_id, token=self.hf_token)
+        ch_len = len(self.channels)  # CHANNEL_LEN
+        preferred_repo = _build_repo_id(ch_len, self.device_type, self.version, self.comment)
+        try:
+            weights_path, cfg = _hf_download(preferred_repo, token=self.hf_token)
+        except Exception as e_primary:
+            legacy_repo = f"ardor924/EEGNetV4-{ch_len}ch-{self.device_type}-Ver{self.version}"
+            try:
+                weights_path, cfg = _hf_download(legacy_repo, token=self.hf_token)
+            except Exception as e_legacy:
+                raise FileNotFoundError(
+                    f"Failed to download weights.\n"
+                    f"  tried: {preferred_repo}\n"
+                    f"  and  : {legacy_repo}\n"
+                    f"Original errors: {e_primary} | {e_legacy}"
+                )
+
         sd = _load_state_dict_generic(weights_path, map_location=self.torch_device)
         if not _looks_compat(sd):
             raise RuntimeError("Unsupported checkpoint (expected 'firstconv/depthwise/separable/...')")
 
-        F1, D, F2, k1, k2, p1, p2 = _infer_hparams_from_sd(sd, chans=len(self.channels))
+        F1, D, F2, k1, k2, p1, p2 = _infer_hparams_from_sd(sd, chans=ch_len)
         # config.json 값으로 보정(존재 시)
         k1 = int(cfg.get("kernel_length", k1))
         k2 = int(cfg.get("sep_length", k2))
@@ -271,7 +403,7 @@ class EEGInferenceEngine:
         pool1 = int(cfg.get("pool1", 4)); pool2 = int(cfg.get("pool2", 8))
 
         self.model = EEGNetV4Compat(
-            n_classes=len(CLASS_NAMES), Chans=len(self.channels),
+            n_classes=len(CLASS_NAMES), Chans=ch_len,
             k1=k1, k2=k2, F1=F1, D=D, F2=F2,
             pool1=pool1, pool2=pool2, dropout=dropout
         ).to(self.torch_device)
@@ -279,11 +411,12 @@ class EEGInferenceEngine:
         self.model.eval()
 
         # ----- 캘리브레이션/바이어스 -----
-        self.temperature     = float(os.getenv("EEG_TEMP",              cfg.get("temperature", 1.0)))
-        self.prior_strength  = float(os.getenv("EEG_PRIOR_STRENGTH",    cfg.get("prior_strength", 0.0)))
+        self.temperature     = float(os.getenv("EEG_TEMP",           cfg.get("temperature", 1.0)))
+        self.prior_strength  = float(os.getenv("EEG_PRIOR_STRENGTH", cfg.get("prior_strength", 0.0)))
+
         # class prior
         prior_cfg = cfg.get("class_prior", None)
-        env_prior = os.getenv("EEG_CLASS_PRIOR", None)  # "CN:0.34,AD:0.33,FTD:0.33"
+        env_prior = os.getenv("EEG_CLASS_PRIOR", None)  # 예: "CN:0.34,AD:0.33,FTD:0.33"
         if env_prior:
             try:
                 d = {}
@@ -300,7 +433,7 @@ class EEGInferenceEngine:
 
         # decision bias
         bias_cfg = cfg.get("decision_bias", None)
-        env_bias = os.getenv("EEG_DECISION_BIAS", None)  # "0,0.05,-0.05"
+        env_bias = os.getenv("EEG_DECISION_BIAS", None)  # 예: "0,0.05,-0.05"
         if env_bias:
             try: bias_cfg = [float(x) for x in env_bias.split(",")]
             except Exception: pass
@@ -328,17 +461,36 @@ class EEGInferenceEngine:
     def _read_any(self, file_path: str) -> Tuple[np.ndarray, float]:
         ext = os.path.splitext(file_path)[-1].lower()
         if ext == ".csv":
-            data, srate = _load_muselab_csv(file_path, csv_order=self.csv_order)
-            return data, srate  # (4,T), 250
+            # CSV 입력:
+            # - muse: MuseLab 전용 CSV 포맷(eeg_1~4 + timestamps + csv_order)
+            # - 그 외: 범용 CSV 로더(채널 열이 있어야 함)
+            if self.device_type == "muse":
+                data, srate = _load_muselab_csv(file_path, csv_order=self.csv_order)
+            else:
+                data, srate = _load_device_csv(file_path, channels=self.channels)
+            return data, srate
+
         elif ext == ".set":
+            # EEGLAB .set: 모든 기기 공통
             raw = mne.io.read_raw_eeglab(file_path, preload=True, verbose='ERROR')
             miss = [ch for ch in self.channels if ch not in raw.ch_names]
             if miss:
-                raise ValueError(f"Channels missing in file: {miss}\nPresent: {raw.ch_names}\nExpected: {self.channels}")
+                raise ValueError(
+                    f"Channels missing in file: {miss}\n"
+                    f"Present: {raw.ch_names}\nExpected: {self.channels}"
+                )
             raw.pick_channels(self.channels)
+
+            _maybe_notch(raw)
             raw.filter(LOW_FREQ, HIGH_FREQ, fir_design='firwin', verbose='ERROR')
             raw.resample(TARGET_SRATE, verbose='ERROR')
+            try:
+                raw.set_eeg_reference('average', projection=False, verbose='ERROR')
+            except Exception:
+                pass
+
             return raw.get_data(), TARGET_SRATE
+
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
@@ -362,6 +514,7 @@ class EEGInferenceEngine:
 
         segs_z = _per_record_zscore(segs)
         x = torch.from_numpy(segs_z)[:, None, :, :].to(self.torch_device)
+
         # batched logits
         outs = []
         for i in range(0, x.size(0), BATCH_SIZE):
@@ -369,12 +522,12 @@ class EEGInferenceEngine:
         logits_all = np.concatenate(outs, axis=0)
         probs_all  = _softmax_np(self._apply_calib(logits_all))
 
+        # 윈도우 선택
         if N < need:
             s_best, use = 0, N
         else:
             s_best, use = self._choose_best_window(probs_all, need)
 
-        # 세그먼트 지표
         block_logits = logits_all[s_best:s_best+use]
         block_probs  = probs_all[s_best:s_best+use]
         y_pred = block_probs.argmax(axis=1)
@@ -415,3 +568,28 @@ class EEGInferenceEngine:
             "subject_id": sid,
             "window": {"start": int(s_best * EVAL_HOP_SEC), "need": int(WINDOW_NEED_SECONDS)}
         }
+
+# ========================= 보조 함수들 =========================
+def _segment_overlap(data: np.ndarray, win_sec: float, hop_sec: float, sfreq: float) -> np.ndarray:
+    C, T = data.shape
+    win = int(round(win_sec * sfreq))
+    hop = int(round(hop_sec * sfreq))
+    if T < win:
+        return np.empty((0, C, win), dtype=np.float32)
+    idxs = list(range(0, T - win + 1, hop))
+    return np.stack([data[:, i:i+win] for i in idxs], axis=0).astype(np.float32)
+
+def _per_record_zscore(segs: np.ndarray) -> np.ndarray:
+    mean = segs.mean(axis=(0,2), keepdims=True)
+    std  = segs.std(axis=(0,2), keepdims=True) + 1e-7
+    return (segs - mean) / std
+
+def _quality_weights(segs: np.ndarray) -> np.ndarray:
+    std = segs.std(axis=(1,2))
+    med = np.median(std) + 1e-8
+    return np.where(std < 0.2 * med, 1e-3, 1.0).astype(np.float32)
+
+def _softmax_np(x: np.ndarray) -> np.ndarray:
+    x = x - np.max(x, axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / (np.sum(e, axis=-1, keepdims=True) + 1e-12)

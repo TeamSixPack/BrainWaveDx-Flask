@@ -44,7 +44,6 @@ BATCH_SIZE            = int(os.getenv("EEG_BATCH_SIZE", "64"))
 DEFAULT_DEVICE  = os.getenv("EEG_DEVICE_DEFAULT", "muse").strip().lower()
 DEFAULT_VER     = os.getenv("EEG_WEIGHTS_VER", "29").strip()
 DEFAULT_COMMENT = os.getenv("EEG_WEIGHTS_COMMENT", "").strip()
-
 # ========================= 모델 정의(Compat) =========================
 class EEGNetV4Compat(nn.Module):
     def __init__(self, n_classes: int, Chans: int,
